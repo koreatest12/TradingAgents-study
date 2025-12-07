@@ -1,0 +1,110 @@
+name: CI/CD - Information Server Setup and Deployment (Final)
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # ====================================================================
+  # 1. CI (지속적 통합) - 파일 강제 생성, 빌드 및 아티팩트 준비
+  # (기존 CI_BUILD Job은 생략하고, 변경된 Job만 아래에 추가했습니다.)
+  # ====================================================================
+  ci_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📦 레포지토리 체크아웃
+        uses: actions/checkout@v4
+        
+      # ... (기존 CI 빌드 및 준비 스텝들은 여기에 위치) ...
+      
+      - name: 📤 배포 패키지 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-deployment-package
+          path: |
+            ./artifacts/
+            ./spring-boot-app/target/*.jar # JAR 타겟 파일 경로
+
+  # ====================================================================
+  # 2. CD (지속적 배포) - 인프라 설정 및 유효성 검증
+  # ====================================================================
+  cd_deploy:
+    needs: ci_build
+    runs-on: ubuntu-latest
+    steps:
+      # ... (기존 CD 배포 스텝들은 여기에 위치) ...
+      
+      - name: 💻 서버에 파일 배포 (배포 가능)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          source: "./deploy-package/*"
+          target: "/var/www/data-server/"
+          
+      # ... (기존 검증 스텝들은 여기에 위치) ...
+
+  ---
+
+  # ====================================================================
+  # 3. Workflows 관리 - 실패한 워크플로우 인스턴스 강제 취소 (추가된 기능)
+  # ====================================================================
+  workflow_cleanup:
+    name: 🧹 실패한 이전 워크플로우 강제 종료/비활성화
+    runs-on: ubuntu-latest
+    needs: cd_deploy # 배포가 성공적으로 완료된 후 또는 독립적으로 실행 가능
+    if: always() # 배포 Job의 성공/실패와 관계없이 항상 실행
+    
+    steps:
+      - name: 🛡️ GitHub CLI 설정 및 인증 확인
+        uses: actions/setup-gh@v1
+        with:
+          version: 2.x
+        
+      - name: 🔍 실패한 워크플로우 찾기 및 취소 (GitHub CLI 사용)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 취소할 워크플로우 이름 (현재 워크플로우 이름과 동일)
+          TARGET_WORKFLOW_NAME: 'CI/CD - Information Server Setup and Deployment (Final)' 
+          TARGET_BRANCH: 'main'
+          
+        run: |
+          echo "--- 현재 리포지토리의 실패한 워크플로우 실행 목록 검색 ---"
+          
+          # 1. 대상 워크플로우 실행 목록을 'failure' 상태로 필터링하여 JSON으로 가져옴
+          # jq를 사용하여 'id'만 추출
+          FAILED_RUN_IDS=$(gh api \
+            /repos/${{ github.repository }}/actions/runs \
+            -f status=failure \
+            -f event=push \
+            -f branch=${{ env.TARGET_BRANCH }} \
+            --jq '.workflow_runs[] | select(.name == "${{ env.TARGET_WORKFLOW_NAME }}") | .id')
+
+          if [ -z "$FAILED_RUN_IDS" ]; then
+            echo "✅ 취소할 'failure' 상태의 이전 워크플로우 실행을 찾지 못했습니다."
+            exit 0
+          fi
+
+          echo "❌ 다음 실패한 워크플로우 실행 ID들을 취소합니다: $FAILED_RUN_IDS"
+
+          # 2. 각 실패한 워크플로우 ID에 대해 강제 취소 API 호출 (비활성화)
+          for run_id in $FAILED_RUN_IDS; do
+            echo "--- 인스턴스 ID: $run_id 강제 취소 시도 중... ---"
+            
+            # 워크플로우 실행 강제 취소 API 호출
+            CANCEL_RESPONSE=$(gh api \
+              --method POST \
+              /repos/${{ github.repository }}/actions/runs/$run_id/cancel \
+              --silent \
+              -H "Accept: application/vnd.github.v3+json")
+              
+            if [ $? -eq 0 ]; then
+              echo "✅ ID $run_id 취소 요청 성공."
+            else
+              echo "❌ ID $run_id 취소 요청 실패."
+            fi
+            
+          done
+          echo "모든 실패한 이전 워크플로우 실행에 대한 강제 종료/비활성화 작업 완료."
